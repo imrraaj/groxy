@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -23,14 +28,20 @@ type BackendHealth struct {
 	Failures       int
 	mu             sync.Mutex
 	Timeout        time.Duration
+
+	// Circuit breaker fields
+	CircuitOpen    bool
+	CircuitOpenAt  time.Time
+	CircuitTimeout time.Duration
 }
 
-func NewBackendHealth(url string) BackendHealth {
+func NewBackendHealth(url string, timeout time.Duration) BackendHealth {
 	return BackendHealth{
 		HealthCheckURL: url,
-		Timeout:        time.Second,
-		Healthy:        false,
+		Timeout:        timeout,
+		Healthy:        true,
 		LastCheck:      time.Now(),
+		CircuitTimeout: 30 * time.Second, // Circuit breaker timeout
 	}
 }
 
@@ -59,30 +70,61 @@ func (this *Backend) CheckHealth() {
 	}
 
 	resp, err := client.Get(this.HealthCheckURL())
+	this.Bh.LastCheck = time.Now()
+
 	if err != nil {
 		this.Bh.Failures++
 		this.Bh.Healthy = false
-		this.Bh.LastCheck = time.Now()
-		log.Printf("Health check failed for %s: %v", this.Stringify(), err)
+		// Only log after multiple failures to reduce noise
+		if this.Bh.Failures == 1 || this.Bh.Failures%5 == 0 {
+			log.Printf("Health check failed for %s (failures: %d): %v",
+				this.Stringify(), this.Bh.Failures, err)
+		}
 		return
 	}
 	defer resp.Body.Close()
 
-	log.Printf("%s: %d\n", this.HealthCheckURL(), resp.StatusCode)
-
-	this.Bh.LastCheck = time.Now()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if !this.Bh.Healthy {
+			log.Printf("Backend %s recovered after %d failures",
+				this.Stringify(), this.Bh.Failures)
+		}
 		this.Bh.Healthy = true
 		this.Bh.Failures = 0
-		log.Println("set healthy")
 	} else {
 		this.Bh.Failures++
 		this.Bh.Healthy = false
-		log.Printf("Health check failed for %s: %v", this.Stringify(), err)
+		if this.Bh.Failures == 1 || this.Bh.Failures%5 == 0 {
+			log.Printf("Health check failed for %s: status %d (failures: %d)",
+				this.Stringify(), resp.StatusCode, this.Bh.Failures)
+		}
 	}
 }
 
 func (this *Backend) IsHealthy() bool {
+	this.Bh.mu.Lock()
+	defer this.Bh.mu.Unlock()
+
+	// Circuit breaker logic
+	if this.Bh.CircuitOpen {
+		if time.Since(this.Bh.CircuitOpenAt) > this.Bh.CircuitTimeout {
+			this.Bh.CircuitOpen = false
+			this.Bh.Failures = 0 // Reset failures when circuit closes
+			log.Printf("Circuit breaker reset for %s", this.Stringify())
+		} else {
+			return false
+		}
+	}
+
+	// Open circuit after too many failures
+	if this.Bh.Failures >= 5 && !this.Bh.CircuitOpen {
+		this.Bh.CircuitOpen = true
+		this.Bh.CircuitOpenAt = time.Now()
+		log.Printf("Circuit breaker opened for %s after %d failures",
+			this.Stringify(), this.Bh.Failures)
+		return false
+	}
+
 	return this.Bh.Healthy
 }
 
@@ -127,13 +169,15 @@ func (this *LoadBalancer) Next() *Backend {
 }
 
 type Proxy struct {
-	lb     LoadBalancer
-	client *http.Client
+	lb           LoadBalancer
+	client       *http.Client
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
 
 	hc HealthChecker
 }
 
-func NewReverseProxy(backends []*Backend) *Proxy {
+func NewReverseProxy(backends []*Backend, readTimeout, writeTimeout time.Duration) *Proxy {
 	transport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 5,
@@ -150,8 +194,10 @@ func NewReverseProxy(backends []*Backend) *Proxy {
 			backends: backends,
 			last:     0,
 		},
-		client: &http.Client{Transport: transport},
-		hc:     hc,
+		client:       &http.Client{Transport: transport},
+		hc:           hc,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
 	}
 }
 
@@ -194,7 +240,7 @@ func (this *Proxy) StreamResponse(w http.ResponseWriter, res *http.Response) {
 
 func (this *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	backend := this.lb.Next()
-	log.Printf("%s: %s", backend.HealthCheckURL(), backend.Bh.Healthy)
+	log.Printf("%s: %v", backend.HealthCheckURL(), backend.Bh.Healthy)
 	if backend != nil && backend.Bh.Healthy == false {
 		// If the returned backend is unhealty it means all the backends are unhealty. The Next() function bound to return healthy backend if it exists
 		// handle all the backend are unhealth
@@ -236,16 +282,61 @@ func (this *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	mux := http.NewServeMux()
-	backends := []*Backend{
-		{Protocol: HTTP, Host: "localhost", Port: 8001, Bh: NewBackendHealth("/health")},
-		{Protocol: HTTP, Host: "localhost", Port: 8002, Bh: NewBackendHealth("/health")},
+	configFile := flag.String("config", "~/.config/groxy.json", "Configuration file for the proxy / reverse proxy")
+	flag.Parse()
+	config, err := LoadConfig(*configFile)
+	if err != nil {
+		log.Fatalf("ERROR: Unable to load the file %s\n", err.Error())
 	}
-	proxy := NewReverseProxy(backends)
+
+	backends := []*Backend{}
+	for _, b := range config.Backends {
+		bk := Backend{
+			Protocol: Protocol(b.Protocol),
+			Host:     b.Host,
+			Port:     b.Port,
+			Bh:       NewBackendHealth(b.Health.Path, b.Health.Interval),
+		}
+		backends = append(backends, &bk)
+	}
+
+	groxyURL := fmt.Sprintf(":%d", config.Proxy.Port)
+	proxy := NewReverseProxy(backends, time.Duration(config.Proxy.ReadTimeout)*time.Second, time.Duration(config.Proxy.WriteTimeout)*time.Second)
 	go proxy.hc.StartHealthCheck()
+
+	// Setup graceful shutdown
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	mux := http.NewServeMux()
 	mux.HandleFunc("/", proxy.ServeHTTP)
 
-	if err := http.ListenAndServe(":6969", mux); err != nil {
-		log.Fatalln("ERROR: ", err.Error())
+	fmt.Printf("%s %s\n", config.Proxy.ReadTimeout, config.Proxy.WriteTimeout)
+	server := &http.Server{
+		Addr:         groxyURL,
+		Handler:      mux,
+		ReadTimeout:  time.Duration(config.Proxy.ReadTimeout) * time.Second,
+		WriteTimeout: time.Duration(config.Proxy.WriteTimeout) * time.Second,
+	}
+
+	go func() {
+		log.Printf("Groxy server starting on %s", groxyURL)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed: %v", err)
+		}
+	}()
+
+	// Wait for shutdown signal
+	<-c
+	log.Println("Shutting down gracefully...")
+
+	// Create a context with timeout for graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	} else {
+		log.Println("Server shutdown complete")
 	}
 }

@@ -1,0 +1,27 @@
+{
+    "proxy": {
+        "port": 6969,
+        "read_timeout": 30,
+        "write_timeout": 30
+    },
+    "backends": [
+        {
+            "protocol": "http",
+            "host": "localhost", 
+            "port": 8001,
+            "weight": 1.0,
+            "health_check_path": "/health"
+        },
+        {
+            "protocol": "http",
+            "host": "localhost", 
+            "port": 8002,
+            "weight": 1.0,
+            "health_check_path": "/health"
+        }
+
+    ],
+    "load_balancer": {
+        "algorithm": "round-robin"
+    }
+}
