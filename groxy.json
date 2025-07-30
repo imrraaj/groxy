@@ -1,27 +1,51 @@
 {
     "proxy": {
-        "port": 6969,
+        "port": 80,
         "read_timeout": 30,
         "write_timeout": 30
     },
-    "backends": [
+    "routes": [
         {
-            "protocol": "http",
-            "host": "localhost", 
-            "port": 8001,
-            "weight": 1.0,
-            "health_check_path": "/health"
+            "host": "a.local",
+            "backends": [
+                {
+                    "protocol": "http",
+                    "host": "127.0.0.1",
+                    "port": 8001,
+                    "health": {
+                        "path": "/health",
+                        "interval": 10
+                    }
+                }
+            ]
         },
         {
-            "protocol": "http",
-            "host": "localhost", 
-            "port": 8002,
-            "weight": 1.0,
-            "health_check_path": "/health"
+            "host": "b.local",
+            "backends": [
+                {
+                    "protocol": "http",
+                    "host": "127.0.0.1",
+                    "port": 8002,
+                    "health": {
+                        "path": "/health",
+                        "interval": 10
+                    }
+                }
+            ]
+        },
+        {
+            "host": "*.example.com",
+            "backends": [
+                {
+                    "protocol": "http",
+                    "host": "127.0.0.1",
+                    "port": 8003,
+                    "health": {
+                        "path": "/health",
+                        "interval": 10
+                    }
+                }
+            ]
         }
-
-    ],
-    "load_balancer": {
-        "algorithm": "round-robin"
-    }
+    ]
 }

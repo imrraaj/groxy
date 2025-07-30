@@ -10,19 +10,22 @@ import (
 type Config struct {
 	Proxy struct {
 		Port         int `json:"port"`
-		ReadTimeout  int `json:"read_timeout,format:sec"`
-		WriteTimeout int `json:"write_timeout,format:sec"`
+		ReadTimeout  int `json:"read_timeout"`
+		WriteTimeout int `json:"write_timeout"`
 	} `json:"proxy"`
-	Backends []struct {
-		Protocol string  `json:"protocol"`
-		Host     string  `json:"host"`
-		Port     int     `json:"port"`
-		Weight   float32 `json:"weight"`
-		Health   struct {
-			Path     string        `json:"path"`
-			Interval time.Duration `json:"interval"`
-		} `json:"health"`
-	} `json:"backends"`
+	Routes []struct {
+		Host     string `json:"host"`
+		Backends []struct {
+			Protocol string  `json:"protocol"`
+			Host     string  `json:"host"`
+			Port     int     `json:"port"`
+			Weight   float32 `json:"weight"`
+			Health   struct {
+				Path     string        `json:"path"`
+				Interval time.Duration `json:"interval"`
+			} `json:"health"`
+		} `json:"backends"`
+	} `json:"routes"`
 
 	LoadBalancer struct {
 		Algorithm string `json:"algorithm"` // round-robin, weighted, least-conn
@@ -52,16 +55,19 @@ func (config *Config) Validate() error {
 		return fmt.Errorf("invalid proxy port: %d", config.Proxy.Port)
 	}
 
-	if len(config.Backends) == 0 {
-		return fmt.Errorf("no backends configured")
-	}
+	for _, route := range config.Routes {
 
-	for i, backend := range config.Backends {
-		if backend.Host == "" {
-			return fmt.Errorf("backend %d: host is required", i)
+		if len(route.Backends) == 0 {
+			return fmt.Errorf("no backends configured")
 		}
-		if backend.Port <= 0 {
-			return fmt.Errorf("backend %d: invalid port %d", i, backend.Port)
+
+		for i, backend := range route.Backends {
+			if backend.Host == "" {
+				return fmt.Errorf("backend %d: host is required", i)
+			}
+			if backend.Port <= 0 {
+				return fmt.Errorf("backend %d: invalid port %d", i, backend.Port)
+			}
 		}
 	}
 

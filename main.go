@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -169,35 +171,34 @@ func (this *LoadBalancer) Next() *Backend {
 }
 
 type Proxy struct {
-	lb           LoadBalancer
+	router       *Router
 	client       *http.Client
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
-
-	hc HealthChecker
+	hc           HealthChecker
 }
 
-func NewReverseProxy(backends []*Backend, readTimeout, writeTimeout time.Duration) *Proxy {
+func NewReverseProxy(config *Config) *Proxy {
 	transport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 5,
-		IdleConnTimeout:     10 * time.Second,
+		IdleConnTimeout:     time.Duration(config.Proxy.ReadTimeout) * time.Second,
 		DisableCompression:  true,
 	}
+
+	router := NewRouter(config)
+	allBackends := router.getAllBackends()
 	hc := HealthChecker{
-		Backends: backends,
+		Backends: allBackends,
 		Interval: time.Second * 5,
 		Timeout:  time.Second,
 	}
 	return &Proxy{
-		lb: LoadBalancer{
-			backends: backends,
-			last:     0,
-		},
+		router:       router,
 		client:       &http.Client{Transport: transport},
 		hc:           hc,
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
+		ReadTimeout:  time.Duration(config.Proxy.ReadTimeout) * time.Second,
+		WriteTimeout: time.Duration(config.Proxy.WriteTimeout) * time.Second,
 	}
 }
 
@@ -237,11 +238,38 @@ func (this *Proxy) StreamResponse(w http.ResponseWriter, res *http.Response) {
 		log.Printf("Error streaming response: %v", err)
 	}
 }
+func (this *Proxy) MetricsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	metrics := map[string]any{
+		"backends":  make(map[string]any),
+		"timestamp": time.Now().Unix(),
+	}
+
+	for i, backend := range this.router.getAllBackends() {
+		metrics["backends"].([]map[string]any)[i] = map[string]any{
+			"url":        backend.Stringify(),
+			"healthy":    backend.IsHealthy(),
+			"failures":   backend.Bh.Failures,
+			"last_check": backend.Bh.LastCheck.Unix(),
+		}
+	}
+	json.NewEncoder(w).Encode(metrics)
+}
 
 func (this *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	backend := this.lb.Next()
-	log.Printf("%s: %v", backend.HealthCheckURL(), backend.Bh.Healthy)
-	if backend != nil && backend.Bh.Healthy == false {
+	host := r.Host
+	if strings.Contains(host, ":") {
+		host, _, _ = strings.Cut(host, ":")
+	}
+	backend := this.router.GetBackend(host)
+	if backend == nil {
+		log.Printf("No backend found for host: %s", host)
+		http.Error(w, "No backend available for this host", http.StatusNotFound)
+		return
+	}
+
+	if backend.Bh.Healthy == false {
 		// If the returned backend is unhealty it means all the backends are unhealty. The Next() function bound to return healthy backend if it exists
 		// handle all the backend are unhealth
 		w.Header().Set("Content-Type", "text/html")
@@ -289,20 +317,9 @@ func main() {
 		log.Fatalf("ERROR: Unable to load the file %s\n", err.Error())
 	}
 
-	backends := []*Backend{}
-	for _, b := range config.Backends {
-		bk := Backend{
-			Protocol: Protocol(b.Protocol),
-			Host:     b.Host,
-			Port:     b.Port,
-			Bh:       NewBackendHealth(b.Health.Path, b.Health.Interval),
-		}
-		backends = append(backends, &bk)
-	}
-
 	groxyURL := fmt.Sprintf(":%d", config.Proxy.Port)
-	proxy := NewReverseProxy(backends, time.Duration(config.Proxy.ReadTimeout)*time.Second, time.Duration(config.Proxy.WriteTimeout)*time.Second)
-	go proxy.hc.StartHealthCheck()
+	proxy := NewReverseProxy(config)
+	// go proxy.hc.StartHealthCheck()
 
 	// Setup graceful shutdown
 	c := make(chan os.Signal, 1)
@@ -310,8 +327,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", proxy.ServeHTTP)
+	mux.HandleFunc("/metrics", proxy.MetricsHandler)
 
-	fmt.Printf("%s %s\n", config.Proxy.ReadTimeout, config.Proxy.WriteTimeout)
 	server := &http.Server{
 		Addr:         groxyURL,
 		Handler:      mux,
@@ -325,12 +342,8 @@ func main() {
 			log.Fatalf("Server failed: %v", err)
 		}
 	}()
-
-	// Wait for shutdown signal
 	<-c
 	log.Println("Shutting down gracefully...")
-
-	// Create a context with timeout for graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
