@@ -1,48 +1,43 @@
 {
     "proxy": {
-        "port": 80,
+        "port": 6969,
         "read_timeout": 30,
         "write_timeout": 30
     },
     "routes": [
         {
-            "host": "a.local",
+            "host": "localhost",
             "backends": [
                 {
                     "protocol": "http",
-                    "host": "127.0.0.1",
+                    "host": "localhost",
                     "port": 8001,
                     "health": {
                         "path": "/health",
-                        "interval": 10
+                        "interval": 120
                     }
-                }
-            ]
-        },
-        {
-            "host": "b.local",
-            "backends": [
+                },
                 {
                     "protocol": "http",
-                    "host": "127.0.0.1",
+                    "host": "localhost",
                     "port": 8002,
                     "health": {
                         "path": "/health",
-                        "interval": 10
+                        "interval": 120
                     }
                 }
             ]
         },
         {
-            "host": "*.example.com",
+            "host": "ssd",
             "backends": [
                 {
                     "protocol": "http",
-                    "host": "127.0.0.1",
-                    "port": 8003,
+                    "host": "localhost",
+                    "port": 8002,
                     "health": {
                         "path": "/health",
-                        "interval": 10
+                        "interval": 120
                     }
                 }
             ]

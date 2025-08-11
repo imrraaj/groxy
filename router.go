@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"sync"
+	"time"
 )
 
 type Route struct {
@@ -18,13 +19,13 @@ type Router struct {
 func NewRouter(config *Config) *Router {
 	routes := make(map[string]*Route)
 	for _, cRoute := range config.Routes {
-		rBackends := make([]*Backend, len(cRoute.Backends))
+		rBackends := make([]*Backend, 0, len(cRoute.Backends))
 		for _, b := range cRoute.Backends {
 			bk := Backend{
 				Protocol: Protocol(b.Protocol),
 				Host:     b.Host,
 				Port:     b.Port,
-				Bh:       NewBackendHealth(b.Health.Path, b.Health.Interval),
+				Health:   NewBackendHealth(b.Health.Path, b.Health.Interval*time.Second),
 			}
 			rBackends = append(rBackends, &bk)
 		}

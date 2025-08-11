@@ -1,0 +1,23 @@
+{
+    "proxy": {
+        "port": 8080,
+        "read_timeout": 30,
+        "write_timeout": 30
+    },
+    "routes": [
+        {
+            "host": "localhost",
+            "backends": [
+                {
+                    "protocol": "http",
+                    "host": "127.0.0.1",
+                    "port": 8001,
+                    "health": {
+                        "path": "/health",
+                        "interval": 5
+                    }
+                }
+            ]
+        }
+    ]
+}
